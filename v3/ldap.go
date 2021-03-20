@@ -276,7 +276,13 @@ func addDefaultLDAPResponseDescriptions(packet *ber.Packet) error {
 	packet.Children[1].Children[1].Description = "Matched DN (" + matchedDN + ")"
 	packet.Children[1].Children[2].Description = description
 	if len(packet.Children[1].Children) > 3 {
-		packet.Children[1].Children[3].Description = "Referral"
+		switch {
+		case resultCode == LDAPResultReferral:
+			packet.Children[1].Children[3].Description = "Referral"
+		case isIdentifier(packet.Children[1].Children[3], ber.ClassContext, ber.TypePrimitive, LDAP_TAG_SASL_RES_CREDS):
+			packet.Children[1].Children[3].Description = "SASL Server Credentials"
+
+		}
 	}
 	if len(packet.Children) == 3 {
 		return addControlDescriptions(packet.Children[2])

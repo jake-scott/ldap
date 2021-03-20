@@ -3,6 +3,7 @@ package ldap
 import (
 	"bytes"
 	"crypto/md5"
+	"encoding/binary"
 	enchex "encoding/hex"
 	"errors"
 	"fmt"
@@ -12,6 +13,17 @@ import (
 
 	"github.com/Azure/go-ntlmssp"
 	ber "github.com/go-asn1-ber/asn1-ber"
+
+	"github.com/jake-scott/go-gssapi"
+	_ "github.com/jake-scott/go-gssapi/krb5"
+)
+
+type SaslGssapiQualityOfProtection int8
+
+const (
+	saslGssapiLayerAuth SaslGssapiQualityOfProtection = 1 << iota
+	saslGssapiLayerIntegrity
+	saslGssapiLayerConfidentiality
 )
 
 // SimpleBindRequest represents a username/password bind operation
@@ -537,4 +549,200 @@ func (l *Conn) NTLMChallengeBind(ntlmBindRequest *NTLMBindRequest) (*NTLMBindRes
 
 	err = GetLDAPError(packet)
 	return result, err
+}
+
+type GSSAPIBindRequest struct {
+	Controls []Control
+	gss      gssapi.Mech
+	hostname string
+	outToken []byte
+	conn     *Conn
+	msgCtx   *messageContext
+}
+
+func (req *GSSAPIBindRequest) appendTo(envelope *ber.Packet) (err error) {
+
+	request := ber.Encode(ber.ClassApplication, ber.TypeConstructed, ApplicationBindRequest, nil, "Bind Request")
+	request.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, 3, "Version"))
+	request.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", "User Name"))
+
+	saslAuth := ber.Encode(ber.ClassContext, ber.TypeConstructed, 3, "", "authentication")
+	saslAuth.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "GSSAPI", "SASL Mech"))
+
+	if req.outToken != nil {
+		saslAuth.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, string(req.outToken), "SASL Cred"))
+	}
+
+	request.AppendChild(saslAuth)
+	envelope.AppendChild(request)
+	if len(req.Controls) > 0 {
+		envelope.AppendChild(encodeControls(req.Controls))
+	}
+	return nil
+}
+
+func (req *GSSAPIBindRequest) Auth() (err error) {
+	req.outToken, err = req.gss.Initiate("ldap/"+req.hostname,
+		gssapi.ContextFlagMutual|gssapi.ContextFlagInteg|gssapi.ContextFlagConf|gssapi.ContextFlagSequence)
+
+	for err == gssapi.ContinueNeeded {
+
+		req.msgCtx, err = req.conn.doRequest(req)
+		if err != nil {
+			return err
+		}
+
+		var packet *ber.Packet
+		packet, err = req.conn.readPacket(req.msgCtx)
+		if err != nil {
+			return err
+		}
+		req.conn.Debug.Printf("%d: got response %p", req.msgCtx.id, packet)
+		if req.conn.Debug {
+			if err = addLDAPDescriptions(packet); err != nil {
+				return err
+			}
+			ber.PrintPacket(packet)
+		}
+
+		if len(packet.Children) != 2 || len(packet.Children[1].Children) != 4 {
+			return GetLDAPError(packet)
+		}
+
+		if code, ok := packet.Children[1].Children[0].Value.(int64); !(ok && code == LDAPResultSaslBindInProgress) {
+			return GetLDAPError(packet)
+		}
+
+		if !isIdentifier(packet.Children[1].Children[3], ber.ClassContext, ber.TypePrimitive, LDAP_TAG_SASL_RES_CREDS) {
+			return GetLDAPError(packet)
+		}
+
+		inToken := packet.Children[1].Children[3].Data.Bytes()
+
+		req.outToken, err = req.gss.Continue(inToken)
+	}
+
+	return err
+}
+
+func (req *GSSAPIBindRequest) Negotiate() (err error) {
+	// send the last token (probably empty)
+	req.msgCtx, err = req.conn.doRequest(req)
+	if err != nil {
+		return err
+	}
+
+	// read response from server
+	var packet *ber.Packet
+	packet, err = req.conn.readPacket(req.msgCtx)
+	if err != nil {
+		return err
+	}
+
+	if len(packet.Children) != 2 || len(packet.Children[1].Children) != 4 {
+		return GetLDAPError(packet)
+	}
+
+	if code, ok := packet.Children[1].Children[0].Value.(int64); !(ok && code == LDAPResultSaslBindInProgress) {
+		return GetLDAPError(packet)
+	}
+
+	if !isIdentifier(packet.Children[1].Children[3], ber.ClassContext, ber.TypePrimitive, LDAP_TAG_SASL_RES_CREDS) {
+		return GetLDAPError(packet)
+	}
+
+	// unwrap the GSSAPI token
+	inTokenWrapped := packet.Children[1].Children[3].Data.Bytes()
+	inTokenData, err := req.gss.Unwrap(inTokenWrapped)
+
+	if len(inTokenData) != 4 {
+		return fmt.Errorf("gssapi: bad 4 byte payload, got %d", len(inTokenData))
+	}
+
+	buf := bytes.NewBuffer(inTokenData)
+	//	var serverQOPOffer SaslGssapiQualityOfProtection
+	var serverQOPOffer int8
+	binary.Read(buf, binary.BigEndian, &serverQOPOffer)
+
+	// for now insist on sign/seal
+	wantQOP := saslGssapiLayerConfidentiality
+	if serverQOPOffer&int8(wantQOP) == 0 {
+		return fmt.Errorf("gssapi: server does not support sign/seal")
+	}
+
+	// max message size the acceptor will accept
+	inTokenData[0] = 0
+	buf = bytes.NewBuffer(inTokenData)
+	var acceptorMaxSize uint32
+	binary.Read(buf, binary.BigEndian, &acceptorMaxSize)
+
+	// prepare the response..
+	outTokenData := make([]byte, 4)
+	binary.BigEndian.PutUint32(outTokenData, 65536)
+	outTokenData[0] = byte(wantQOP)
+
+	req.outToken, err = req.gss.Wrap(outTokenData, false) // no confidentiality
+
+	req.msgCtx, err = req.conn.doRequest(req)
+
+	if err != nil {
+		return err
+	}
+
+	return
+}
+
+func (req *GSSAPIBindRequest) Bind() (err error) {
+	defer func() {
+		if req.msgCtx != nil {
+			req.conn.finishMessage(req.msgCtx)
+		}
+	}()
+
+	// First part - GSSAPI authentication
+	if err := req.Auth(); err != nil {
+		return err
+	}
+
+	// Validate that the GSS context supports our required parameters
+	ctxFlags := req.gss.ContextFlags()
+	if ctxFlags&gssapi.ContextFlagInteg == 0 || // integrity always required
+		ctxFlags&gssapi.ContextFlagMutual == 0 || // required for a security layer
+		ctxFlags&gssapi.ContextFlagSequence == 0 || // required for a security layer
+		ctxFlags&gssapi.ContextFlagConf == 0 { // required for seal
+		return fmt.Errorf("gssapi: context security parameters insufficient")
+	}
+
+	// and negotiate parameters
+	if err := req.Negotiate(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type GSSAPIBindResult struct {
+	Controls []Control
+}
+
+const LDAP_TAG_SASL_RES_CREDS = 7
+
+func (l *Conn) GSSAPIBind() (err error) {
+	l.Debug.Enable(true)
+
+	req := &GSSAPIBindRequest{
+		hostname: l.dialedHost,
+		gss:      gssapi.NewMech("kerberos_v5"),
+		conn:     l,
+	}
+
+	err = req.Bind()
+
+	return
+}
+
+func isIdentifier(packet *ber.Packet, class ber.Class, ttype ber.Type, tag ber.Tag) bool {
+	return packet.Identifier.ClassType == class &&
+		packet.Identifier.TagType == ttype &&
+		packet.Identifier.Tag == tag
 }

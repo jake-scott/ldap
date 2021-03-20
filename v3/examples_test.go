@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"testing"
 )
 
 // This example demonstrates how to bind a connection to an ldap user
@@ -390,4 +391,20 @@ func ExampleConn_ExternalBind() {
 	}
 
 	// Conduct ldap queries
+}
+
+func TestGssapiAuthentication(t *testing.T) {
+	// connect to ldap server
+	l, err := DialURL("ldap://wellard.poptart.org:389")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer l.Close()
+
+	// sasl external bind
+	err = l.GSSAPIBind()
+	if err != nil {
+		log.Fatal(err)
+	}
+
 }

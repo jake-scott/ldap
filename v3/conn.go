@@ -102,6 +102,7 @@ type Conn struct {
 	wgClose             sync.WaitGroup
 	outstandingRequests uint
 	messageMutex        sync.Mutex
+	dialedHost          string
 }
 
 var _ Client = &Conn{}
@@ -134,6 +135,11 @@ func DialWithTLSConfig(tc *tls.Config) DialOpt {
 type DialContext struct {
 	d  *net.Dialer
 	tc *tls.Config
+}
+
+func removePort(addr string) string {
+	host, _, _ := net.SplitHostPort(addr)
+	return host
 }
 
 func (dc *DialContext) dial(u *url.URL) (net.Conn, error) {
@@ -177,6 +183,7 @@ func Dial(network, addr string) (*Conn, error) {
 	}
 	conn := NewConn(c, false)
 	conn.Start()
+	conn.dialedHost = removePort(addr)
 	return conn, nil
 }
 
@@ -190,6 +197,7 @@ func DialTLS(network, addr string, config *tls.Config) (*Conn, error) {
 	}
 	conn := NewConn(c, true)
 	conn.Start()
+	conn.dialedHost = removePort(addr)
 	return conn, nil
 }
 
@@ -217,6 +225,7 @@ func DialURL(addr string, opts ...DialOpt) (*Conn, error) {
 
 	conn := NewConn(c, u.Scheme == "ldaps")
 	conn.Start()
+	conn.dialedHost = u.Hostname()
 	return conn, nil
 }
 
